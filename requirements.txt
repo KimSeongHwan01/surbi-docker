@@ -1,0 +1,30 @@
+# requirements.txt
+# 프로덕션 의존성
+
+# Web Framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+gunicorn==22.0.0
+
+# DB / ORM
+sqlalchemy[asyncio]==2.0.36
+geoalchemy2==0.15.2
+asyncpg==0.29.0
+alembic==1.13.3
+psycopg2-binary==2.9.9
+
+# Redis / ARQ
+redis[asyncio]==5.0.8
+arq==0.26.1
+
+# 설정 관리
+pydantic-settings==2.5.2
+python-dotenv==1.0.1
+
+# HTTP 클라이언트 (외부 API 호출)
+httpx==0.27.2
+
+# 인증
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.12

@@ -1,0 +1,37 @@
+# .gitignore
+
+# 환경변수 (절대 커밋 금지)
+.env
+.env.local
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+htmlcov/
+.coverage
+
+# Docker 볼륨 로컬 마운트
+postgres_data/
+redis_data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# SSL 인증서 (로컬 테스트용 포함 금지)
+*.crt
+*.key
+*.pem

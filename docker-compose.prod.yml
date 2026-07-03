@@ -1,0 +1,66 @@
+# docker-compose.prod.yml
+# ──────────────────────────────────────────────
+# 프로덕션 환경 전용 override
+# - 포트는 Nginx만 외부 노출 (DB, Redis는 내부 네트워크 격리)
+# - 코드 볼륨 마운트 없음 (이미지 빌드 기반)
+# - Cloudflare Origin 인증서 마운트
+# - 리소스 제한 설정
+# ──────────────────────────────────────────────
+
+services:
+
+  api:
+    build:
+      target: production
+    command: >
+      gunicorn app.main:app
+      -w 2
+      -k uvicorn.workers.UvicornWorker
+      --bind 0.0.0.0:8000
+      --access-logfile -
+      --error-logfile -
+    environment:
+      ENVIRONMENT: production
+      DEBUG: "false"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768M
+
+  worker:
+    environment:
+      ENVIRONMENT: production
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  postgres:
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  redis:
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  nginx:
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.prod.conf:/etc/nginx/conf.d/default.conf:ro
+      - /etc/ssl/cloudflare/origin.crt:/etc/ssl/certs/surbi.crt:ro
+      - /etc/ssl/cloudflare/origin.key:/etc/ssl/private/surbi.key:ro
+      - /var/www/surbi/web:/var/www/html:ro
+    deploy:
+      resources:
+        limits:
+          memory: 128M
