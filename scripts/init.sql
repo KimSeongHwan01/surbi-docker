@@ -371,7 +371,7 @@ CREATE INDEX IF NOT EXISTS idx_market_trends_district_period ON market_trends(di
 CREATE INDEX IF NOT EXISTS idx_scores_district_category ON scores(district_id, category);
 
 -- government_supports: 대상+분야 기준 필터링
-CREATE INDEX IF NOT EXISTS idx_gov_supports_target ON government_supports(target);
+CREATE INDEX IF NOT EXISTS idx_gov_supports_target ON government_supports(support_target);
 CREATE INDEX IF NOT EXISTS idx_gov_supports_category ON government_supports(category);
 CREATE INDEX IF NOT EXISTS idx_gov_supports_end_date ON government_supports(end_date);
 
