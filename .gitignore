@@ -35,3 +35,6 @@ Thumbs.db
 *.crt
 *.key
 *.pem
+
+# Firebase 서비스 계정 키 (로컬 테스트용 포함 금지)
+secrets/

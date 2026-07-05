@@ -26,6 +26,7 @@ services:
       LLM_API_KEY: ${LLM_API_KEY}
       KAKAO_API_KEY: ${KAKAO_API_KEY}
       ENVIRONMENT: ${ENVIRONMENT}
+      FIREBASE_CREDENTIALS_PATH: ${FIREBASE_CREDENTIALS_PATH} ##
     networks:
       - surbi_net
 
