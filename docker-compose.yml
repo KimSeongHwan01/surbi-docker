@@ -29,6 +29,8 @@ services:
       SEOUL_API_KEY: ${SEOUL_API_KEY}
       BIZINFO_API_KEY: ${BIZINFO_API_KEY}
       ENVIRONMENT: ${ENVIRONMENT}
+    volumes:
+      - ./data:/app/data
     networks:
       - surbi_net
 
