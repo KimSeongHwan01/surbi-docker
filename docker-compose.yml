@@ -25,6 +25,9 @@ services:
       SECRET_KEY: ${SECRET_KEY}
       LLM_API_KEY: ${LLM_API_KEY}
       KAKAO_API_KEY: ${KAKAO_API_KEY}
+      SBSC_API_KEY: ${SBSC_API_KEY}
+      SEOUL_API_KEY: ${SEOUL_API_KEY}
+      BIZINFO_API_KEY: ${BIZINFO_API_KEY}
       ENVIRONMENT: ${ENVIRONMENT}
     networks:
       - surbi_net
