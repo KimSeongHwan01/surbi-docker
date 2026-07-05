@@ -24,6 +24,25 @@ SEOUL_API_KEY = os.getenv("SEOUL_API_KEY")
 BASE_URL = f"http://openapi.seoul.go.kr:8088/{SEOUL_API_KEY}/json/SPOP_LOCAL_RESD_DONG"
 
 
+# ── API 호출 결과 최신 날짜 반환 함수 ───────────────────────────
+
+async def get_latest_std_date() -> str:
+    """
+    실제 API 호출해서 데이터가 있는 가장 최신 날짜 반환
+    오늘부터 역순으로 최대 10일 전까지 확인
+    """
+    from datetime import datetime, timedelta
+    for days in range(1, 11):
+        date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+        data = await fetch_populations(date, 1, 5)
+        count = data.get("SPOP_LOCAL_RESD_DONG", {}).get("list_total_count", 0)
+        if count > 0:
+            print(f"  최신 날짜: {date}")
+            return date
+    
+    # 10일 전까지 없으면 오류 발생시켜서 파이프라인 중단
+    raise ValueError("최근 10일 내 생활인구 데이터를 찾을 수 없습니다. API 상태를 확인하세요.")
+
 # ── API 호출 함수 ─────────────────────────────────────────────
 
 async def fetch_populations(std_date: str, start: int = 1, end: int = 1000):
@@ -127,9 +146,9 @@ async def run_populations_pipeline(std_date: str = None):
     - std_date: 기준일자 (없으면 어제 날짜 자동 설정)
     - 페이지네이션 처리
     """
-    # 기준일자 설정 (어제없어서 5일전 기준)
+    # 기준일자 설정 (데이터가 존재하는 가장 최신 날짜 반영)
     if std_date is None:
-        std_date = (datetime.now() - timedelta(days=5)).strftime("%Y%m%d")
+        std_date = await get_latest_std_date()
 
     print(f"생활인구 수집 시작 (기준일: {std_date})")
 
