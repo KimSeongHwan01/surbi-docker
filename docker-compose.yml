@@ -28,6 +28,7 @@ services:
       SBSC_API_KEY: ${SBSC_API_KEY}
       SEOUL_API_KEY: ${SEOUL_API_KEY}
       BIZINFO_API_KEY: ${BIZINFO_API_KEY}
+      TZ: Asia/Seoul
       ENVIRONMENT: ${ENVIRONMENT}
     volumes:
       - ./data:/app/data
@@ -51,6 +52,11 @@ services:
       REDIS_URL: ${REDIS_URL}
       SECRET_KEY: ${SECRET_KEY}
       LLM_API_KEY: ${LLM_API_KEY}
+      SBSC_API_KEY: ${SBSC_API_KEY}
+      SEOUL_API_KEY: ${SEOUL_API_KEY}
+      BIZINFO_API_KEY: ${BIZINFO_API_KEY}
+      PYTHONUNBUFFERED: "1"
+      TZ: Asia/Seoul
       ENVIRONMENT: ${ENVIRONMENT}
     networks:
       - surbi_net

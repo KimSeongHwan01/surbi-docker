@@ -11,8 +11,8 @@
 import httpx
 import asyncio
 from datetime import datetime, timedelta
-from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import select, func
 from app.db.session import AsyncSessionLocal
 from app.models.districts import District
 from app.models.populations import Population
@@ -26,22 +26,39 @@ BASE_URL = f"http://openapi.seoul.go.kr:8088/{SEOUL_API_KEY}/json/SPOP_LOCAL_RES
 
 # ── API 호출 결과 최신 날짜 반환 함수 ───────────────────────────
 
-async def get_latest_std_date() -> str:
+async def get_missing_std_dates() -> list[str]:
     """
-    실제 API 호출해서 데이터가 있는 가장 최신 날짜 반환
-    오늘부터 역순으로 최대 10일 전까지 확인
+    DB에 마지막으로 적재된 날짜 이후부터 오늘까지 누락된 날짜 목록 반환
+    - DB가 비어있으면 가장 최신 날짜 1개만 반환
+    - API 약 5일 지연 제공이므로 오늘 기준 5일 전까지만 확인
     """
-    from datetime import datetime, timedelta
-    for days in range(1, 11):
-        date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
-        data = await fetch_populations(date, 1, 5)
-        count = data.get("SPOP_LOCAL_RESD_DONG", {}).get("list_total_count", 0)
-        if count > 0:
-            print(f"  최신 날짜: {date}")
-            return date
-    
-    # 10일 전까지 없으면 오류 발생시켜서 파이프라인 중단
-    raise ValueError("최근 10일 내 생활인구 데이터를 찾을 수 없습니다. API 상태를 확인하세요.")
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(func.max(Population.std_date)))
+        last_date = result.scalar_one_or_none()
+
+    # DB가 비어있으면 최신 날짜 1개 탐색
+    if last_date is None:
+        for days in range(1, 11):
+            date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+            data = await fetch_populations(date, 1, 5)
+            count = data.get("SPOP_LOCAL_RESD_DONG", {}).get("list_total_count", 0)
+            if count > 0:
+                return [date]
+        raise ValueError("최근 10일 내 생활인구 데이터를 찾을 수 없습니다.")
+
+    # 마지막 적재일 다음날부터 오늘 기준 1일 전까지 날짜 목록 생성
+    from datetime import date as date_type
+    start = last_date + timedelta(days=1)
+    end = datetime.now().date() - timedelta(days=1)
+
+    dates = []
+    current = start
+    while current <= end:
+        dates.append(current.strftime("%Y%m%d"))
+        current += timedelta(days=1)
+
+    return dates if dates else []
+
 
 # ── API 호출 함수 ─────────────────────────────────────────────
 
@@ -141,51 +158,51 @@ async def upsert_population(session, row: dict, district_id: int):
 # ── 메인 파이프라인 함수 ──────────────────────────────────────
 
 async def run_populations_pipeline(std_date: str = None):
-    """
-    populations 전체 파이프라인 실행
-    - std_date: 기준일자 (없으면 어제 날짜 자동 설정)
-    - 페이지네이션 처리
-    """
-    # 기준일자 설정 (데이터가 존재하는 가장 최신 날짜 반영)
-    if std_date is None:
-        std_date = await get_latest_std_date()
+    if std_date is not None:
+        # 날짜 직접 지정한 경우 그대로 실행
+        dates = [std_date]
+    else:
+        dates = await get_missing_std_dates()
 
-    print(f"생활인구 수집 시작 (기준일: {std_date})")
+    if not dates:
+        print("생활인구 수집 시작: 적재할 날짜 없음 (최신 상태)")
+        return
 
-    async with AsyncSessionLocal() as session:
-        start = 1
-        end = 1000
-        total_count = None
+    for date in dates:
+        print(f"생활인구 수집 시작 (기준일: {date})")
 
-        while True:
-            data = await fetch_populations(std_date, start=start, end=end)
-            result = data.get("SPOP_LOCAL_RESD_DONG", {})
-            rows = result.get("row", [])
+        async with AsyncSessionLocal() as session:
+            start = 1
+            end = 1000
+            total_count = None
 
-            if total_count is None:
-                total_count = result.get("list_total_count", 0)
-                print(f"  총 {total_count}건")
+            while True:
+                data = await fetch_populations(date, start=start, end=end)
+                result = data.get("SPOP_LOCAL_RESD_DONG", {})
+                rows = result.get("row", [])
 
-            if not rows:
-                break
+                if total_count is None:
+                    total_count = result.get("list_total_count", 0)
+                    print(f"  총 {total_count}건")
 
-            for row in rows:
-                # district_id 조회
-                district_id = await get_district_id(session, row["ADSTRD_CODE_SE"])
-                if district_id is None:
-                    continue  # districts에 없는 행정동은 건너뜀
+                if not rows:
+                    break
 
-                await upsert_population(session, row, district_id)
+                for row in rows:
+                    district_id = await get_district_id(session, row["ADSTRD_CODE_SE"])
+                    if district_id is None:
+                        continue
+                    await upsert_population(session, row, district_id)
 
-            await session.commit()
-            print(f"  {start}~{end} 완료 ({len(rows)}건)")
+                await session.commit()
+                print(f"  {start}~{end} 완료 ({len(rows)}건)")
 
-            if end >= total_count:
-                break
-            start += 1000
-            end += 1000
+                if end >= total_count:
+                    break
+                start += 1000
+                end += 1000
 
-    print("생활인구 수집 완료!")
+        print(f"생활인구 수집 완료! ({date})")
 
 
 # ── 직접 실행 시 ──────────────────────────────────────────────

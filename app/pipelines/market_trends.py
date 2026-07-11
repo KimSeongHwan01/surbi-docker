@@ -59,9 +59,13 @@ async def upsert_market_trend(session, row: dict, district_id: int):
     ).on_conflict_do_update(
         index_elements=["district_id", "period_code"],
         set_=dict(
-            trend_grade=row.get("TRDAR_CHNGE_IX"),
-            trend_grade_nm=row.get("TRDAR_CHNGE_IX_NM"),
-        )
+        trend_grade=row.get("TRDAR_CHNGE_IX"),
+        trend_grade_nm=row.get("TRDAR_CHNGE_IX_NM"),
+        opr_sale_mt_avrg=row.get("OPR_SALE_MT_AVRG"),
+        cls_sale_mt_avrg=row.get("CLS_SALE_MT_AVRG"),
+        su_opr_sale_mt_avrg=row.get("SU_OPR_SALE_MT_AVRG"),
+        su_cls_sale_mt_avrg=row.get("SU_CLS_SALE_MT_AVRG"),
+    )
     )
     await session.execute(stmt)
 
