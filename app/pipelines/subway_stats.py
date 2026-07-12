@@ -11,6 +11,8 @@ import httpx
 import asyncio
 from datetime import datetime, timedelta
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import select, func
+from app.models.districts import District
 from app.db.session import AsyncSessionLocal
 from app.models.subway_stats import SubwayStat
 import os
@@ -19,6 +21,41 @@ import os
 
 SEOUL_API_KEY = os.getenv("SEOUL_API_KEY")
 BASE_URL = f"http://openapi.seoul.go.kr:8088/{SEOUL_API_KEY}/json/CardSubwayStatsNew"
+
+
+# ── API 호출 결과 최신 날짜 반환 함수 ───────────────────────────
+
+async def get_missing_use_dates() -> list[str]:
+    """
+    DB에 마지막으로 적재된 날짜 이후부터 오늘까지 누락된 날짜 목록 반환
+    - DB가 비어있으면 가장 최신 날짜 1개만 반환
+    - API 약 5일 지연 제공이므로 오늘 기준 5일 전까지만 확인
+    """
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(func.max(SubwayStat.use_date)))
+        last_date = result.scalar_one_or_none()
+
+    # DB가 비어있으면 최신 날짜 1개 탐색
+    if last_date is None:
+        for days in range(1, 11):
+            date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+            data = await fetch_subway_stats(date, 1, 5)
+            count = data.get("CardSubwayStatsNew", {}).get("list_total_count", 0)
+            if count > 0:
+                return [date]
+        raise ValueError("최근 10일 내 지하철 승하차 인원 데이터를 찾을 수 없습니다.")
+    
+    # 마지막 적재일 다음날부터 오늘 기준 1일 전까지 날짜 목록 생성
+    start = last_date + timedelta(days=1)
+    end = datetime.now().date() - timedelta(days=1)
+
+    dates = []
+    current = start
+    while current <= end:
+        dates.append(current.strftime("%Y%m%d"))
+        current += timedelta(days=1)
+
+    return dates if dates else []
 
 
 # ── API 호출 함수 ─────────────────────────────────────────────
@@ -89,44 +126,56 @@ async def upsert_subway_stat(session, row: dict, use_date):
 
 # ── 메인 파이프라인 함수 ──────────────────────────────────────
 
-async def run_subway_stats_pipeline(use_date: str):
+async def run_subway_stats_pipeline(use_date: str = None):
     """
     subway_stats 데이터 수집 파이프라인 실행
     - use_date: 이용일자 (YYYYMMDD)
     """
     print("지하철 승하차 인원 수집 시작")
 
-    parsed_date = parse_date(use_date)
+    if use_date is not None:
+        dates = [use_date]
+    else:
+        dates = await get_missing_use_dates()
     
-    async with AsyncSessionLocal() as session:
-        start = 1
-        end = 1000
-        total_count = None
+    if not dates:
+        print("누락된 날짜가 없습니다. 수집을 종료합니다.")
+        return
+    
+    for date in dates:
+        print(f"수집 대상 날짜: {date}")
 
-        while True:
-            data = await fetch_subway_stats(use_date, start=start, end=end)
-            result = data.get("CardSubwayStatsNew", {})
-            rows = result.get("row", [])
+        parsed_date = parse_date(date)
+    
+        async with AsyncSessionLocal() as session:
+            start = 1
+            end = 1000
+            total_count = None
 
-            if total_count is None:
-                total_count = result.get("list_total_count", 0)
-                print(f"  총 {total_count}건")
+            while True:
+                data = await fetch_subway_stats(date, start=start, end=end)
+                result = data.get("CardSubwayStatsNew", {})
+                rows = result.get("row", [])
 
-            if not rows:
-                break
+                if total_count is None:
+                    total_count = result.get("list_total_count", 0)
+                    print(f"  총 {total_count}건")
 
-            for row in rows:
-                await upsert_subway_stat(session, row, parsed_date)
+                if not rows:
+                    break
 
-            await session.commit()
-            print(f"  {start}~{end} 완료 ({len(rows)}건)")
+                for row in rows:
+                    await upsert_subway_stat(session, row, parsed_date)
 
-            if end >= total_count:
-                break
-            start += 1000
-            end += 1000
+                await session.commit()
+                print(f"  {start}~{end} 완료 ({len(rows)}건)")
 
-    print("지하철 승하차 인원 수집 완료!")
+                if end >= total_count:
+                    break
+                start += 1000
+                end += 1000
+
+        print("지하철 승하차 인원 수집 완료!")
 
 
 # ── 직접 실행 시 ──────────────────────────────────────────────
