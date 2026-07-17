@@ -8,27 +8,35 @@
 # Step 3: reqstBeginEndDe 날짜 파싱 (start_date / end_date 분리)
 # Step 4: government_supports 테이블 UPSERT
 
-import httpx
 import asyncio
+import logging
+import os
 import re
 from datetime import datetime
 from html.parser import HTMLParser
+
+import httpx
+from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert
+
 from app.db.session import AsyncSessionLocal
 from app.models.government_supports import GovernmentSupport
-import os
 
 # ── 상수 정의 ────────────────────────────────────────────────
-
 BIZINFO_API_KEY = os.getenv("BIZINFO_API_KEY")
 API_URL = "https://www.bizinfo.go.kr/uss/rss/bizinfoApi.do"
 PAGE_SIZE = 100
+MAX_PAGES = 50  # 최대 50페이지 (5,000건)
+
+
+# ── 로거 설정 ─────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
 
 
 # ── HTML 태그 제거 함수 ───────────────────────────────────────
-
 class _MLStripper(HTMLParser):
     """HTML 태그를 제거하는 파서"""
+
     def __init__(self):
         super().__init__()
         self.reset()
@@ -52,7 +60,6 @@ def strip_html(raw: str) -> str | None:
 
 
 # ── 날짜 파싱 함수 ────────────────────────────────────────────
-
 def parse_date_range(raw: str | None) -> tuple:
     """
     'YYYY-MM-DD ~ YYYY-MM-DD' 형식 -> (start_date, end_date) 반환
@@ -65,31 +72,30 @@ def parse_date_range(raw: str | None) -> tuple:
         return None, None
     try:
         start = datetime.strptime(parts[0].strip(), "%Y-%m-%d").date()
-        end   = datetime.strptime(parts[1].strip(), "%Y-%m-%d").date()
+        end = datetime.strptime(parts[1].strip(), "%Y-%m-%d").date()
         return start, end
     except ValueError:
         return None, None
 
 
 # ── API 호출 함수 ─────────────────────────────────────────────
-
-async def fetch_supports(page: int = 1) -> list[dict]:
+async def fetch_supports(client: httpx.AsyncClient, page: int = 1) -> list[dict]:
     """
     기업마당 API 단일 페이지 호출 -> 아이템 리스트 반환
+    - client: 파이프라인 전체에서 재사용하는 AsyncClient (연결 풀 활용)
     - 응답 구조: {"jsonArray": [...]} 또는 직접 리스트
     - item이 단일 dict로 내려오는 경우 리스트로 감싸기
     """
     params = {
-        "crtfcKey":  BIZINFO_API_KEY,
-        "dataType":  "json",
-        "pageUnit":  PAGE_SIZE,
+        "crtfcKey": BIZINFO_API_KEY,
+        "dataType": "json",
+        "pageUnit": PAGE_SIZE,
         "pageIndex": page,
     }
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.get(API_URL, params=params)
-        response.raise_for_status()
-        data = response.json()
+    response = await client.get(API_URL, params=params)
+    response.raise_for_status()
+    data = response.json()
 
     if isinstance(data, dict):
         items = data.get("jsonArray") or data.get("item") or []
@@ -103,14 +109,13 @@ async def fetch_supports(page: int = 1) -> list[dict]:
 
 
 # ── government_supports 적재 함수 ────────────────────────────
-
 async def upsert_support(session, item: dict) -> bool:
     """
     government_supports 테이블 UPSERT
     - UNIQUE: pblanc_id
-    - 예약어 회피 컬럼: support_target, sprt_start_date, support_url
     - summary: bsnsSumryCn HTML 태그 제거 후 저장
     - sprt_start_date / end_date: reqstBeginEndDe 파싱
+    - 선택값: 새 값이 NULL이면 기존 값 유지 (COALESCE)
     """
     sprt_start_date, end_date = parse_date_range(item.get("reqstBeginEndDe"))
 
@@ -118,7 +123,7 @@ async def upsert_support(session, item: dict) -> bool:
     if not pblanc_id:
         return False
 
-    stmt = insert(GovernmentSupport).values(
+    insert_stmt = insert(GovernmentSupport).values(
         pblanc_id=str(pblanc_id),
         title=item.get("pblancNm"),
         category=item.get("pldirSportRealmLclasCodeNm"),
@@ -130,20 +135,46 @@ async def upsert_support(session, item: dict) -> bool:
         sprt_start_date=sprt_start_date,
         end_date=end_date,
         support_url=item.get("pblancUrl"),
-    ).on_conflict_do_update(
+    )
+
+    stmt = insert_stmt.on_conflict_do_update(
         index_elements=["pblanc_id"],
-        set_=dict(
-            title=item.get("pblancNm"),
-            sprt_start_date=sprt_start_date,
-            end_date=end_date,
-        )
+        set_={
+            "title": func.coalesce(insert_stmt.excluded.title, GovernmentSupport.title),
+            "category": func.coalesce(
+                insert_stmt.excluded.category, GovernmentSupport.category
+            ),
+            "support_type": func.coalesce(
+                insert_stmt.excluded.support_type, GovernmentSupport.support_type
+            ),
+            "support_target": func.coalesce(
+                insert_stmt.excluded.support_target, GovernmentSupport.support_target
+            ),
+            "agency": func.coalesce(
+                insert_stmt.excluded.agency, GovernmentSupport.agency
+            ),
+            "jrsd_instt_nm": func.coalesce(
+                insert_stmt.excluded.jrsd_instt_nm, GovernmentSupport.jrsd_instt_nm
+            ),
+            "summary": func.coalesce(
+                insert_stmt.excluded.summary, GovernmentSupport.summary
+            ),
+            "sprt_start_date": func.coalesce(
+                insert_stmt.excluded.sprt_start_date, GovernmentSupport.sprt_start_date
+            ),
+            "end_date": func.coalesce(
+                insert_stmt.excluded.end_date, GovernmentSupport.end_date
+            ),
+            "support_url": func.coalesce(
+                insert_stmt.excluded.support_url, GovernmentSupport.support_url
+            ),
+        },
     )
     await session.execute(stmt)
     return True
 
 
 # ── 메인 파이프라인 함수 ──────────────────────────────────────
-
 async def run_government_supports_pipeline():
     """
     government_supports 전체 파이프라인 실행
@@ -151,42 +182,76 @@ async def run_government_supports_pipeline():
     - PAGE_SIZE보다 적은 결과가 오면 마지막 페이지로 판단
     - totCnt: API 응답 내 전체 건수 필드
     """
-    print("정부지원사업 수집 시작")
+    logger.info("정부지원사업 수집 시작")
 
-    async with AsyncSessionLocal() as session:
-        page = 1
-        total_count = None
+    if not BIZINFO_API_KEY:
+        raise RuntimeError("BIZINFO_API_KEY 환경변수가 설정되지 않았습니다.")
 
-        while True:
-            items = await fetch_supports(page=page)
+    async with httpx.AsyncClient(timeout=30) as client:
+        async with AsyncSessionLocal() as session:
+            page = 1
+            total_count = None
 
-            if not items:
-                break
+            while True:
+                # 무한 루프 방지
+                if page > MAX_PAGES:
+                    raise RuntimeError(
+                        f"최대 페이지 수 초과 ({MAX_PAGES}). 전체 데이터 수집이 완료되지 않았습니다."
+                    )
 
-            # 첫 페이지에서 전체 건수 출력
-            if total_count is None:
-                total_count = int(items[0].get("totCnt", 0))
-                print(f"  총 {total_count}건")
+                items = await fetch_supports(client, page=page)
 
-            for item in items:
-                await upsert_support(session, item)
+                if not items:
+                    break
 
-            await session.commit()
+                # 첫 페이지에서 전체 건수 출력
+                if total_count is None:
+                    raw_total = items[0].get("totCnt")
+                    if raw_total not in (None, ""):
+                        total_count = int(raw_total)
+                        logger.info(f"  총 {total_count}건")
+                    else:
+                        logger.warning(
+                            "API 응답에 totCnt가 없어 페이지 크기로 종료 여부를 판단합니다."
+                        )
 
-            start = (page - 1) * PAGE_SIZE + 1
-            end   = start + len(items) - 1
-            print(f"  {start}~{end} 완료 ({len(items)}건)")
+                start = (page - 1) * PAGE_SIZE + 1
+                end = start + len(items) - 1
 
-            # 마지막 페이지 감지
-            if len(items) < PAGE_SIZE:
-                break
+                try:
+                    success_count = 0
+                    skipped_count = 0
+                    for item in items:
+                        if await upsert_support(session, item):
+                            success_count += 1
+                        else:
+                            skipped_count += 1
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
+                    logger.exception(f"정부지원사업 적재 실패: {start}~{end}")
+                    raise
 
-            page += 1
-            await asyncio.sleep(0.5)  # API 서버 부하 방지
+                logger.info(
+                    f"  {start}~{end} 완료 (조회 {len(items)}건 / 적재 {success_count}건 / 누락 {skipped_count}건)"
+                )
 
-    print("정부지원사업 수집 완료!")
+                # 마지막 페이지 감지
+                reached_total = total_count is not None and end >= total_count
+                if reached_total or len(items) < PAGE_SIZE:
+                    break
+
+                page += 1
+                await asyncio.sleep(0.5)  # API 서버 부하 방지
+
+    logger.info("정부지원사업 수집 완료!")
 
 
 # ── 직접 실행 시 ──────────────────────────────────────────────
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
     asyncio.run(run_government_supports_pipeline())
