@@ -2,9 +2,11 @@
 # FastAPI 애플리케이션 시작점
 # 모든 라우터와 DB 연결을 여기서 통합
 
-from fastapi import FastAPI
 from contextlib import asynccontextmanager
-from app.db.session import engine, Base
+
+from fastapi import FastAPI
+
+from app.db.session import async_engine
 
 
 # 앱 시작/종료 시 실행할 작업 정의
@@ -15,7 +17,7 @@ async def lifespan(app: FastAPI):
     yield
     # 서버 종료 시
     print("Surbi API 서버 종료")
-    await engine.dispose()
+    await async_engine.dispose()
 
 
 # FastAPI 앱 생성
@@ -23,7 +25,7 @@ app = FastAPI(
     title="Surbi API",
     description="AI 기반 창업 상권 분석 플랫폼 API",
     version="0.1.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
 

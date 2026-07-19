@@ -40,7 +40,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: python -m arq app.workers.main.WorkerSettings
+    command: python -m arq workers.main.WorkerSettings
     restart: unless-stopped
     depends_on:
       postgres:
@@ -55,8 +55,8 @@ services:
       SBSC_API_KEY: ${SBSC_API_KEY}
       SEOUL_API_KEY: ${SEOUL_API_KEY}
       BIZINFO_API_KEY: ${BIZINFO_API_KEY}
-      PYTHONUNBUFFERED: "1"
       TZ: Asia/Seoul
+      WEBHOOK_URL: ${WEBHOOK_URL}
       ENVIRONMENT: ${ENVIRONMENT}
     networks:
       - surbi_net
