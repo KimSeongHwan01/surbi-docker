@@ -10,6 +10,7 @@
 # - sales_stats        : 월 1회 (매월 1일 새벽 3시) — districts 완료 후 실행
 # - market_trends      : 월 1회 (매월 1일 새벽 3시 20분) — districts 이후, 매출과 시작 시각 분리
 # - populations        : 매일 새벽 4시 — 월 1일에도 districts 갱신 이후 실행
+# - subway_stats       : 매일 새벽 4시 15분 — 생활인구와 시작 시각 분리
 # - government_supports: 매주 월요일 새벽 4시 30분 — 독립 테이블, 주요 수집 시간대와 분리
 
 
@@ -26,6 +27,7 @@ from app.pipelines.government_supports import run_government_supports_pipeline
 from app.pipelines.market_trends import run_market_trends_pipeline
 from app.pipelines.populations import run_populations_pipeline
 from app.pipelines.sales_stats import run_sales_pipeline
+from app.pipelines.subway_stats import run_subway_stats_pipeline
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
@@ -82,6 +84,17 @@ async def task_populations(ctx: dict) -> str:
         return "ok"
     except Exception as e:
         await send_webhook(f"❌ 생활인구 수집 실패\n{e}", success=False)
+        raise
+
+
+async def task_subway_stats(ctx: dict) -> str:
+    """지하철역 유동인구 수집 — 매일"""
+    try:
+        await asyncio.to_thread(run_subway_stats_pipeline)
+        await send_webhook("✅ 지하철역 유동인구 수집 완료")
+        return "ok"
+    except Exception as e:
+        await send_webhook(f"❌ 지하철역 유동인구 수집 실패\n{e}", success=False)
         raise
 
 
@@ -142,6 +155,7 @@ class WorkerSettings:
 
     functions = [
         task_populations,
+        task_subway_stats,
         task_government_supports,
         task_sales_stats,
         task_market_trends,
@@ -157,6 +171,8 @@ class WorkerSettings:
         cron(task_market_trends, day=1, hour=3, minute=20),
         # 생활인구 — 매일 수집, 월 1일에도 districts 갱신 이후 실행
         cron(task_populations, hour=4, minute=0),
+        # 지하철역 유동인구 — 매일 수집
+        cron(task_subway_stats, hour=4, minute=15),
         # 정부지원사업 — 독립 테이블, 주요 수집 시간대와 분리
         cron(task_government_supports, weekday="mon", hour=4, minute=30),
     ]
