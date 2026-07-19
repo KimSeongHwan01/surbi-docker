@@ -15,7 +15,6 @@
 # Step 4: 상권명 → 자치구 수동 매핑
 # Step 5: rent_stats 테이블 UPSERT
 
-import asyncio
 import json
 import logging
 import os
@@ -23,7 +22,7 @@ import re
 
 from sqlalchemy.dialects.postgresql import insert
 
-from app.db.session import AsyncSessionLocal
+from app.db.session import SyncSessionLocal
 from app.models.rent_stats import RentStat
 
 # ── 로거 설정 ─────────────────────────────────────────────────
@@ -121,7 +120,20 @@ def parse_period_code(header_str: str) -> str | None:
     return None
 
 
-async def run_rent_stats_pipeline(json_file_path: str = None):
+def to_float(value):
+    """임대료 값 변환 — 쉼표·대시 등 비정상 문자 처리"""
+    if value is None:
+        return None
+    text = str(value).replace(",", "").strip()
+    if text.upper() in {"", "-", "–", "—", "N/A"}:
+        return None
+    try:
+        return float(text)
+    except (ValueError, TypeError):
+        return None
+
+
+def run_rent_stats_pipeline(json_file_path: str = None):
     """
     rent_stats 전체 파이프라인 실행
     - json_file_path: JSON 파일 경로. 없으면 기본 경로 사용
@@ -142,10 +154,13 @@ async def run_rent_stats_pipeline(json_file_path: str = None):
     # JSON 구조 검증
     try:
         data = raw["sheet"]["1"]["data"]
-    except (KeyError, TypeError):
+    except (KeyError, TypeError) as exc:
         raise ValueError(
             "JSON 파일 구조가 예상 형식과 다릅니다. sheet → 1 → data 항목을 확인하세요."
-        )
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(f"JSON data 형식이 dict가 아닙니다: {type(data).__name__}")
 
     # 헤더 행에서 분기 코드 추출 (인덱스 0번 행)
     header_row = data.get("0")
@@ -155,7 +170,7 @@ async def run_rent_stats_pipeline(json_file_path: str = None):
     period_codes = {}
     for col_idx in range(4, 11):
         header_value = header_row.get(str(col_idx), "")
-        period_code = parse_period_code(str(header_value))
+        period_code = parse_period_code(header_value)
         if period_code:
             period_codes[str(col_idx)] = period_code
 
@@ -170,13 +185,19 @@ async def run_rent_stats_pipeline(json_file_path: str = None):
     # 헤더 행 제외 (0, 1, 2번 행은 헤더)
     skip_rows = {"0", "1", "2"}
 
-    async with AsyncSessionLocal() as session:
+    with SyncSessionLocal() as session:
         count = 0
         unmapped_areas = set()
 
         try:
             for row_key, row in data.items():
                 if row_key in skip_rows:
+                    continue
+
+                if not isinstance(row, dict):
+                    logger.warning(
+                        f"dict 형식이 아닌 행 건너뜀: {row_key} ({type(row).__name__})"
+                    )
                     continue
 
                 region = str(row.get("1", "")).strip()
@@ -191,8 +212,8 @@ async def run_rent_stats_pipeline(json_file_path: str = None):
                 if region != "서울":
                     continue
 
-                # 서울 전체 평균 집계 행 제외 (area_name이 지역명과 동일한 경우)
-                if region == "서울" and area_name == "서울":
+                # 서울 전체 평균 집계 행 제외
+                if area_name == "서울":
                     continue
 
                 # 자치구 매핑 (AREA_TO_GU에 없는 상권명은 None으로 저장)
@@ -201,13 +222,8 @@ async def run_rent_stats_pipeline(json_file_path: str = None):
                     unmapped_areas.add(area_name)
 
                 for col_idx, period_code in period_codes.items():
-                    rent_value = row.get(col_idx)
-                    if rent_value is None or rent_value == "":
-                        continue
-
-                    try:
-                        avg_rent = float(rent_value)
-                    except (ValueError, TypeError):
+                    avg_rent = to_float(row.get(col_idx))
+                    if avg_rent is None:
                         continue
 
                     stmt = (
@@ -226,17 +242,17 @@ async def run_rent_stats_pipeline(json_file_path: str = None):
                             },
                         )
                     )
-                    await session.execute(stmt)
+                    session.execute(stmt)
                     count += 1
 
-            await session.commit()
+            session.commit()
 
         except Exception:
-            await session.rollback()
+            session.rollback()
             logger.exception("임대료 데이터 적재 실패")
             raise
 
-        logger.info(f"  적재 완료: {count}건")
+        logger.info(f"  UPSERT 처리 완료: {count}건")
 
     # 미매핑 상권 요약 출력
     if unmapped_areas:
@@ -252,4 +268,4 @@ if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
     )
-    asyncio.run(run_rent_stats_pipeline())
+    run_rent_stats_pipeline()

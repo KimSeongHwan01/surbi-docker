@@ -8,22 +8,23 @@
 # Step 3: float → int() 캐스팅 (금액/건수 컬럼)
 # Step 4: sales_stats 테이블 UPSERT
 
-import asyncio
 import logging
 import os
+import time
 from datetime import datetime
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 
-from app.db.session import AsyncSessionLocal
+from app.db.session import SyncSessionLocal
 from app.models.districts import District
 from app.models.sales_stats import SalesStat
 
 # ── 상수 정의 ────────────────────────────────────────────────
 SEOUL_API_KEY = os.getenv("SEOUL_API_KEY")
 BASE_URL = f"http://openapi.seoul.go.kr:8088/{SEOUL_API_KEY}/json/VwsmAdstrdSelngW"
+PAGE_SIZE = 1000  # API 페이지당 조회 건수
 MAX_PAGES = 30  # 최대 30페이지 (30,000건) — 현재 약 17페이지(16,659건) 기준 여유값
 BATCH_SIZE = (
     200  # sales_stats Batch UPSERT 단위 (컬럼 약 50개 × 200건 = 10,000개 파라미터)
@@ -35,10 +36,10 @@ logger = logging.getLogger(__name__)
 
 
 # ── API 호출 결과 가장 최신 분기 반환 함수 ──────────────────────
-async def get_latest_period_code(client: httpx.AsyncClient) -> str:
+def get_latest_period_code(client: httpx.Client) -> str:
     """
     실제 API 호출해서 데이터가 있는 가장 최신 분기 코드 반환
-    - client: 파이프라인 전체에서 재사용하는 AsyncClient
+    - client: 파이프라인 전체에서 재사용하는 httpx.Client
     - 현재 분기부터 역순으로 확인
     """
     now = datetime.now()
@@ -56,7 +57,7 @@ async def get_latest_period_code(client: httpx.AsyncClient) -> str:
 
     for y, q in quarters:
         period = f"{y}{q}"
-        data = await fetch_sales(
+        data = fetch_sales(
             client,
             start=1,
             end=5,
@@ -73,23 +74,57 @@ async def get_latest_period_code(client: httpx.AsyncClient) -> str:
 
 
 # ── API 호출 함수 ─────────────────────────────────────────────
-async def fetch_sales(
-    client: httpx.AsyncClient, start: int = 1, end: int = 1000, period_code: str = None
+def fetch_sales(
+    client: httpx.Client,
+    start: int = 1,
+    end: int = 1000,
+    period_code: str = None,
+    max_retries: int = 3,
 ):
     """
     서울시 추정매출 API 호출
-    - client: 파이프라인 전체에서 재사용하는 AsyncClient (연결 풀 활용)
+    - client: 파이프라인 전체에서 재사용하는 httpx.Client (연결 풀 활용)
     - start/end: 페이지 범위
     - period_code: 기준년분기 (예: '20261'). 없으면 전체 조회
+    - 429 및 일시적인 5xx 오류 재시도 (최대 3회, 3초 간격)
     """
     if period_code:
         url = f"{BASE_URL}/{start}/{end}/{period_code}/"
     else:
         url = f"{BASE_URL}/{start}/{end}/"
 
-    response = await client.get(url)
-    response.raise_for_status()
-    return response.json()
+    retryable_status_codes = {429, 500, 502, 503, 504}
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.get(url)
+
+            if response.status_code in retryable_status_codes:
+                if attempt == max_retries:
+                    response.raise_for_status()
+                logger.warning(
+                    f"서울시 추정매출 API 일시 오류 "
+                    f"({start}~{end}, 상태 {response.status_code}, "
+                    f"재시도 {attempt}/{max_retries})"
+                )
+                time.sleep(3)
+                continue
+
+            response.raise_for_status()
+            return response.json()
+
+        except (httpx.TimeoutException, httpx.RequestError) as exc:
+            if attempt == max_retries:
+                raise RuntimeError(
+                    f"서울시 추정매출 API 요청 실패: {start}~{end}"
+                ) from exc
+            logger.warning(
+                f"서울시 추정매출 API 연결 오류 "
+                f"({start}~{end}, 재시도 {attempt}/{max_retries}): {exc}"
+            )
+            time.sleep(3)
+
+    raise RuntimeError(f"서울시 추정매출 API 요청 실패: {start}~{end}")
 
 
 # ── 유틸리티 함수 ─────────────────────────────────────────────
@@ -107,12 +142,12 @@ def to_int(value):
 
 
 # ── district 일괄 조회 함수 ───────────────────────────────────
-async def get_district_map(session, district_codes: set) -> dict:
+def get_district_map(session, district_codes: set) -> dict:
     """
     district_code 목록을 한 번에 IN 쿼리로 조회 → {code: district_id} 딕셔너리 반환
     - 행마다 SELECT 하지 않고 페이지당 1회만 조회 (DB 왕복 최소화)
     """
-    result = await session.execute(
+    result = session.execute(
         select(District.district_code, District.id).where(
             District.district_code.in_(district_codes)
         )
@@ -184,79 +219,114 @@ def build_sales_value(row: dict, district_id: int) -> dict:
 
 
 # ── 메인 파이프라인 함수 ──────────────────────────────────────
-async def run_sales_pipeline(period_code: str = None):
+def run_sales_pipeline(period_code: str = None):
     """
     sales_stats 전체 파이프라인 실행
     - period_code: 기준년분기 직접 지정 시 해당 분기만 수집
     - 미지정 시 API 호출로 최신 분기 자동 감지
-    - AsyncClient를 파이프라인 전체에서 1회만 생성해 HTTP 연결 재사용
+    - httpx.Client를 파이프라인 전체에서 1회만 생성해 HTTP 연결 재사용
     - 페이지당 district 일괄 조회 + Batch UPSERT로 DB 왕복 최소화
     """
     if not SEOUL_API_KEY:
         raise RuntimeError("SEOUL_API_KEY 환경변수가 설정되지 않았습니다.")
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    with httpx.Client(timeout=30) as client:
         if period_code is None:
-            period_code = await get_latest_period_code(client)
+            period_code = get_latest_period_code(client)
 
         logger.info(f"추정매출 수집 시작 (기준분기: {period_code})")
 
-        async with AsyncSessionLocal() as session:
-            start = 1
-            end = 1000
-            total_count = None
-            page = 0
-            all_missing_codes = set()
+        with SyncSessionLocal() as session:
+            try:
+                start = 1
+                end = PAGE_SIZE
+                total_count = None
+                page = 0
+                all_missing_codes = set()
 
-            while True:
-                page += 1
-                if page > MAX_PAGES:
-                    raise RuntimeError(
-                        f"최대 페이지 수 초과 ({MAX_PAGES}). 전체 데이터 수집이 완료되지 않았습니다."
+                while True:
+                    page += 1
+                    if page > MAX_PAGES:
+                        raise RuntimeError(
+                            f"최대 페이지 수 초과 ({MAX_PAGES}). 전체 데이터 수집이 완료되지 않았습니다."
+                        )
+
+                    data = fetch_sales(
+                        client, start=start, end=end, period_code=period_code
                     )
 
-                data = await fetch_sales(
-                    client, start=start, end=end, period_code=period_code
-                )
+                    if not isinstance(data, dict):
+                        raise RuntimeError(
+                            f"서울시 추정매출 API 응답이 dict가 아닙니다: {type(data).__name__}"
+                        )
 
-                if "VwsmAdstrdSelngW" not in data:
-                    logger.error(f"서울시 추정매출 API 비정상 응답: {data}")
-                    raise RuntimeError("서울시 추정매출 API 호출에 실패했습니다.")
+                    result = data.get("VwsmAdstrdSelngW")
+                    if not isinstance(result, dict):
+                        api_result = data.get("RESULT")
+                        raise RuntimeError(
+                            f"서울시 추정매출 API 비정상 응답: {api_result or data}"
+                        )
 
-                result = data.get("VwsmAdstrdSelngW", {})
-                rows = result.get("row", [])
+                    rows = result.get("row", [])
 
-                if total_count is None:
-                    total_count = int(result.get("list_total_count", 0))
-                    logger.info(f"  총 {total_count}건")
+                    if not isinstance(rows, list):
+                        raise RuntimeError(
+                            f"서울시 추정매출 API row 형식이 리스트가 아닙니다: {type(rows).__name__}"
+                        )
 
-                if not rows:
-                    break
+                    if not all(isinstance(row, dict) for row in rows):
+                        raise RuntimeError(
+                            "서울시 추정매출 API row에 dict가 아닌 항목이 포함되어 있습니다."
+                        )
 
-                # district 일괄 조회
-                codes = {row["ADSTRD_CD"] for row in rows}
-                district_map = await get_district_map(session, codes)
+                    if total_count is None:
+                        raw_total = result.get("list_total_count")
+                        try:
+                            total_count = int(str(raw_total).replace(",", "").strip())
+                        except (TypeError, ValueError) as exc:
+                            raise RuntimeError(
+                                f"서울시 추정매출 API list_total_count 값이 올바르지 않습니다: {raw_total!r}"
+                            ) from exc
 
-                # 미매핑 코드 누적
-                missing_codes = codes - district_map.keys()
-                all_missing_codes.update(missing_codes)
+                        if total_count > PAGE_SIZE * MAX_PAGES:
+                            raise RuntimeError(
+                                f"전체 데이터가 최대 수집 범위를 초과했습니다. "
+                                f"전체 {total_count}건 / 최대 {PAGE_SIZE * MAX_PAGES}건"
+                            )
 
-                # 복합 키 중복 제거 후 Batch UPSERT
-                values_by_key = {}
-                missing_row_count = 0
-                for row in rows:
-                    district_id = district_map.get(row["ADSTRD_CD"])
-                    if district_id is None:
-                        missing_row_count += 1
-                        continue
-                    key = (district_id, row["SVC_INDUTY_CD"], row["STDR_YYQU_CD"])
-                    values_by_key[key] = build_sales_value(row, district_id)
+                        logger.info(f"  총 {total_count}건")
 
-                values_list = list(values_by_key.values())
-                skipped = len(rows) - len(values_list)
+                    if not rows:
+                        if total_count is not None and start <= total_count:
+                            raise RuntimeError(
+                                f"전체 {total_count}건 중 {start}~{end} 구간이 비어 있습니다. "
+                                "API 응답 누락 가능성이 있습니다."
+                            )
+                        break
 
-                if values_list:
-                    try:
+                    # district 일괄 조회
+                    codes = {str(row["ADSTRD_CD"]).strip() for row in rows}
+                    district_map = get_district_map(session, codes)
+
+                    # 미매핑 코드 누적
+                    missing_codes = codes - district_map.keys()
+                    all_missing_codes.update(missing_codes)
+
+                    # 복합 키 중복 제거 후 Batch UPSERT
+                    values_by_key = {}
+                    missing_row_count = 0
+                    for row in rows:
+                        district_code = str(row["ADSTRD_CD"]).strip()
+                        district_id = district_map.get(district_code)
+                        if district_id is None:
+                            missing_row_count += 1
+                            continue
+                        key = (district_id, row["SVC_INDUTY_CD"], row["STDR_YYQU_CD"])
+                        values_by_key[key] = build_sales_value(row, district_id)
+
+                    values_list = list(values_by_key.values())
+
+                    if values_list:
                         for i in range(0, len(values_list), BATCH_SIZE):
                             batch = values_list[i : i + BATCH_SIZE]
                             insert_stmt = insert(SalesStat).values(batch)
@@ -268,73 +338,218 @@ async def run_sales_pipeline(period_code: str = None):
                                 ],
                                 set_={
                                     "category": insert_stmt.excluded.category,
-                                    "monthly_sales": insert_stmt.excluded.monthly_sales,
-                                    "monthly_sales_count": insert_stmt.excluded.monthly_sales_count,
-                                    "weekday_sales": insert_stmt.excluded.weekday_sales,
-                                    "weekend_sales": insert_stmt.excluded.weekend_sales,
-                                    "mon_sales": insert_stmt.excluded.mon_sales,
-                                    "tue_sales": insert_stmt.excluded.tue_sales,
-                                    "wed_sales": insert_stmt.excluded.wed_sales,
-                                    "thu_sales": insert_stmt.excluded.thu_sales,
-                                    "fri_sales": insert_stmt.excluded.fri_sales,
-                                    "sat_sales": insert_stmt.excluded.sat_sales,
-                                    "sun_sales": insert_stmt.excluded.sun_sales,
-                                    "tmzon_00_06_sales": insert_stmt.excluded.tmzon_00_06_sales,
-                                    "tmzon_06_11_sales": insert_stmt.excluded.tmzon_06_11_sales,
-                                    "tmzon_11_14_sales": insert_stmt.excluded.tmzon_11_14_sales,
-                                    "tmzon_14_17_sales": insert_stmt.excluded.tmzon_14_17_sales,
-                                    "tmzon_17_21_sales": insert_stmt.excluded.tmzon_17_21_sales,
-                                    "tmzon_21_24_sales": insert_stmt.excluded.tmzon_21_24_sales,
-                                    "male_sales": insert_stmt.excluded.male_sales,
-                                    "female_sales": insert_stmt.excluded.female_sales,
-                                    "age10_sales": insert_stmt.excluded.age10_sales,
-                                    "age20_sales": insert_stmt.excluded.age20_sales,
-                                    "age30_sales": insert_stmt.excluded.age30_sales,
-                                    "age40_sales": insert_stmt.excluded.age40_sales,
-                                    "age50_sales": insert_stmt.excluded.age50_sales,
-                                    "age60_sales": insert_stmt.excluded.age60_sales,
-                                    "weekday_sales_count": insert_stmt.excluded.weekday_sales_count,
-                                    "weekend_sales_count": insert_stmt.excluded.weekend_sales_count,
-                                    "mon_sales_count": insert_stmt.excluded.mon_sales_count,
-                                    "tue_sales_count": insert_stmt.excluded.tue_sales_count,
-                                    "wed_sales_count": insert_stmt.excluded.wed_sales_count,
-                                    "thu_sales_count": insert_stmt.excluded.thu_sales_count,
-                                    "fri_sales_count": insert_stmt.excluded.fri_sales_count,
-                                    "sat_sales_count": insert_stmt.excluded.sat_sales_count,
-                                    "sun_sales_count": insert_stmt.excluded.sun_sales_count,
-                                    "tmzon_00_06_count": insert_stmt.excluded.tmzon_00_06_count,
-                                    "tmzon_06_11_count": insert_stmt.excluded.tmzon_06_11_count,
-                                    "tmzon_11_14_count": insert_stmt.excluded.tmzon_11_14_count,
-                                    "tmzon_14_17_count": insert_stmt.excluded.tmzon_14_17_count,
-                                    "tmzon_17_21_count": insert_stmt.excluded.tmzon_17_21_count,
-                                    "tmzon_21_24_count": insert_stmt.excluded.tmzon_21_24_count,
-                                    "male_sales_count": insert_stmt.excluded.male_sales_count,
-                                    "female_sales_count": insert_stmt.excluded.female_sales_count,
-                                    "age10_sales_count": insert_stmt.excluded.age10_sales_count,
-                                    "age20_sales_count": insert_stmt.excluded.age20_sales_count,
-                                    "age30_sales_count": insert_stmt.excluded.age30_sales_count,
-                                    "age40_sales_count": insert_stmt.excluded.age40_sales_count,
-                                    "age50_sales_count": insert_stmt.excluded.age50_sales_count,
-                                    "age60_sales_count": insert_stmt.excluded.age60_sales_count,
+                                    "monthly_sales": func.coalesce(
+                                        insert_stmt.excluded.monthly_sales,
+                                        SalesStat.monthly_sales,
+                                    ),
+                                    "monthly_sales_count": func.coalesce(
+                                        insert_stmt.excluded.monthly_sales_count,
+                                        SalesStat.monthly_sales_count,
+                                    ),
+                                    "weekday_sales": func.coalesce(
+                                        insert_stmt.excluded.weekday_sales,
+                                        SalesStat.weekday_sales,
+                                    ),
+                                    "weekend_sales": func.coalesce(
+                                        insert_stmt.excluded.weekend_sales,
+                                        SalesStat.weekend_sales,
+                                    ),
+                                    "mon_sales": func.coalesce(
+                                        insert_stmt.excluded.mon_sales,
+                                        SalesStat.mon_sales,
+                                    ),
+                                    "tue_sales": func.coalesce(
+                                        insert_stmt.excluded.tue_sales,
+                                        SalesStat.tue_sales,
+                                    ),
+                                    "wed_sales": func.coalesce(
+                                        insert_stmt.excluded.wed_sales,
+                                        SalesStat.wed_sales,
+                                    ),
+                                    "thu_sales": func.coalesce(
+                                        insert_stmt.excluded.thu_sales,
+                                        SalesStat.thu_sales,
+                                    ),
+                                    "fri_sales": func.coalesce(
+                                        insert_stmt.excluded.fri_sales,
+                                        SalesStat.fri_sales,
+                                    ),
+                                    "sat_sales": func.coalesce(
+                                        insert_stmt.excluded.sat_sales,
+                                        SalesStat.sat_sales,
+                                    ),
+                                    "sun_sales": func.coalesce(
+                                        insert_stmt.excluded.sun_sales,
+                                        SalesStat.sun_sales,
+                                    ),
+                                    "tmzon_00_06_sales": func.coalesce(
+                                        insert_stmt.excluded.tmzon_00_06_sales,
+                                        SalesStat.tmzon_00_06_sales,
+                                    ),
+                                    "tmzon_06_11_sales": func.coalesce(
+                                        insert_stmt.excluded.tmzon_06_11_sales,
+                                        SalesStat.tmzon_06_11_sales,
+                                    ),
+                                    "tmzon_11_14_sales": func.coalesce(
+                                        insert_stmt.excluded.tmzon_11_14_sales,
+                                        SalesStat.tmzon_11_14_sales,
+                                    ),
+                                    "tmzon_14_17_sales": func.coalesce(
+                                        insert_stmt.excluded.tmzon_14_17_sales,
+                                        SalesStat.tmzon_14_17_sales,
+                                    ),
+                                    "tmzon_17_21_sales": func.coalesce(
+                                        insert_stmt.excluded.tmzon_17_21_sales,
+                                        SalesStat.tmzon_17_21_sales,
+                                    ),
+                                    "tmzon_21_24_sales": func.coalesce(
+                                        insert_stmt.excluded.tmzon_21_24_sales,
+                                        SalesStat.tmzon_21_24_sales,
+                                    ),
+                                    "male_sales": func.coalesce(
+                                        insert_stmt.excluded.male_sales,
+                                        SalesStat.male_sales,
+                                    ),
+                                    "female_sales": func.coalesce(
+                                        insert_stmt.excluded.female_sales,
+                                        SalesStat.female_sales,
+                                    ),
+                                    "age10_sales": func.coalesce(
+                                        insert_stmt.excluded.age10_sales,
+                                        SalesStat.age10_sales,
+                                    ),
+                                    "age20_sales": func.coalesce(
+                                        insert_stmt.excluded.age20_sales,
+                                        SalesStat.age20_sales,
+                                    ),
+                                    "age30_sales": func.coalesce(
+                                        insert_stmt.excluded.age30_sales,
+                                        SalesStat.age30_sales,
+                                    ),
+                                    "age40_sales": func.coalesce(
+                                        insert_stmt.excluded.age40_sales,
+                                        SalesStat.age40_sales,
+                                    ),
+                                    "age50_sales": func.coalesce(
+                                        insert_stmt.excluded.age50_sales,
+                                        SalesStat.age50_sales,
+                                    ),
+                                    "age60_sales": func.coalesce(
+                                        insert_stmt.excluded.age60_sales,
+                                        SalesStat.age60_sales,
+                                    ),
+                                    "weekday_sales_count": func.coalesce(
+                                        insert_stmt.excluded.weekday_sales_count,
+                                        SalesStat.weekday_sales_count,
+                                    ),
+                                    "weekend_sales_count": func.coalesce(
+                                        insert_stmt.excluded.weekend_sales_count,
+                                        SalesStat.weekend_sales_count,
+                                    ),
+                                    "mon_sales_count": func.coalesce(
+                                        insert_stmt.excluded.mon_sales_count,
+                                        SalesStat.mon_sales_count,
+                                    ),
+                                    "tue_sales_count": func.coalesce(
+                                        insert_stmt.excluded.tue_sales_count,
+                                        SalesStat.tue_sales_count,
+                                    ),
+                                    "wed_sales_count": func.coalesce(
+                                        insert_stmt.excluded.wed_sales_count,
+                                        SalesStat.wed_sales_count,
+                                    ),
+                                    "thu_sales_count": func.coalesce(
+                                        insert_stmt.excluded.thu_sales_count,
+                                        SalesStat.thu_sales_count,
+                                    ),
+                                    "fri_sales_count": func.coalesce(
+                                        insert_stmt.excluded.fri_sales_count,
+                                        SalesStat.fri_sales_count,
+                                    ),
+                                    "sat_sales_count": func.coalesce(
+                                        insert_stmt.excluded.sat_sales_count,
+                                        SalesStat.sat_sales_count,
+                                    ),
+                                    "sun_sales_count": func.coalesce(
+                                        insert_stmt.excluded.sun_sales_count,
+                                        SalesStat.sun_sales_count,
+                                    ),
+                                    "tmzon_00_06_count": func.coalesce(
+                                        insert_stmt.excluded.tmzon_00_06_count,
+                                        SalesStat.tmzon_00_06_count,
+                                    ),
+                                    "tmzon_06_11_count": func.coalesce(
+                                        insert_stmt.excluded.tmzon_06_11_count,
+                                        SalesStat.tmzon_06_11_count,
+                                    ),
+                                    "tmzon_11_14_count": func.coalesce(
+                                        insert_stmt.excluded.tmzon_11_14_count,
+                                        SalesStat.tmzon_11_14_count,
+                                    ),
+                                    "tmzon_14_17_count": func.coalesce(
+                                        insert_stmt.excluded.tmzon_14_17_count,
+                                        SalesStat.tmzon_14_17_count,
+                                    ),
+                                    "tmzon_17_21_count": func.coalesce(
+                                        insert_stmt.excluded.tmzon_17_21_count,
+                                        SalesStat.tmzon_17_21_count,
+                                    ),
+                                    "tmzon_21_24_count": func.coalesce(
+                                        insert_stmt.excluded.tmzon_21_24_count,
+                                        SalesStat.tmzon_21_24_count,
+                                    ),
+                                    "male_sales_count": func.coalesce(
+                                        insert_stmt.excluded.male_sales_count,
+                                        SalesStat.male_sales_count,
+                                    ),
+                                    "female_sales_count": func.coalesce(
+                                        insert_stmt.excluded.female_sales_count,
+                                        SalesStat.female_sales_count,
+                                    ),
+                                    "age10_sales_count": func.coalesce(
+                                        insert_stmt.excluded.age10_sales_count,
+                                        SalesStat.age10_sales_count,
+                                    ),
+                                    "age20_sales_count": func.coalesce(
+                                        insert_stmt.excluded.age20_sales_count,
+                                        SalesStat.age20_sales_count,
+                                    ),
+                                    "age30_sales_count": func.coalesce(
+                                        insert_stmt.excluded.age30_sales_count,
+                                        SalesStat.age30_sales_count,
+                                    ),
+                                    "age40_sales_count": func.coalesce(
+                                        insert_stmt.excluded.age40_sales_count,
+                                        SalesStat.age40_sales_count,
+                                    ),
+                                    "age50_sales_count": func.coalesce(
+                                        insert_stmt.excluded.age50_sales_count,
+                                        SalesStat.age50_sales_count,
+                                    ),
+                                    "age60_sales_count": func.coalesce(
+                                        insert_stmt.excluded.age60_sales_count,
+                                        SalesStat.age60_sales_count,
+                                    ),
                                 },
                             )
-                            await session.execute(stmt)
-                        await session.commit()
-                    except Exception:
-                        await session.rollback()
-                        logger.exception(f"추정매출 적재 실패: {start}~{end}")
-                        raise
+                            session.execute(stmt)
 
-                duplicate_count = len(rows) - missing_row_count - len(values_list)
-                logger.info(
-                    f"  {start}~{end} 완료 (조회 {len(rows)}건 / 적재 {len(values_list)}건 / 미매핑 {missing_row_count}건 / 중복 {duplicate_count}건)"
-                )
+                    duplicate_count = len(rows) - missing_row_count - len(values_list)
+                    logger.info(
+                        f"  {start}~{end} 완료 (조회 {len(rows)}건 / 적재 {len(values_list)}건 / 미매핑 {missing_row_count}건 / 중복 {duplicate_count}건)"
+                    )
 
-                if end >= total_count:
-                    break
-                start += 1000
-                end += 1000
+                    if end >= total_count:
+                        break
+                    start += PAGE_SIZE
+                    end = min(start + PAGE_SIZE - 1, total_count)
 
+                # while 종료 후 한 번만 커밋
+                session.commit()
+            except Exception:
+                session.rollback()
+                logger.exception(f"추정매출 적재 실패 (기준분기: {period_code})")
+                raise
         if all_missing_codes:
             logger.info(
                 f"district 미매핑 코드 {len(all_missing_codes)}개 건너뜀: {sorted(all_missing_codes)}"
@@ -349,5 +564,4 @@ if __name__ == "__main__":
         level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
-
-    asyncio.run(run_sales_pipeline())
+    run_sales_pipeline()

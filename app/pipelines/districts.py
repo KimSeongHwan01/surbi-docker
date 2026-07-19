@@ -10,15 +10,15 @@
 # Step 4: businesses INSERT (중복 시 UPDATE)
 # Step 5: 빈 문자열('') → NULL 변환 처리
 
-import asyncio
 import logging
 import os
+import time
 
 import httpx
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 
-from app.db.session import AsyncSessionLocal
+from app.db.session import SyncSessionLocal
 from app.models.businesses import Business
 from app.models.districts import District
 
@@ -68,15 +68,37 @@ logger = logging.getLogger(__name__)
 
 # ── 유틸리티 함수 ─────────────────────────────────────────────
 def empty_to_none(value):
-    """빈 문자열('') → None(NULL) 변환"""
-    if value == "" or value is None:
+    """None 또는 공백 문자열을 None(NULL)으로 변환"""
+    if value is None:
         return None
+    if isinstance(value, str):
+        value = value.strip()
+        return value or None
     return value
 
 
+def to_int_or_none(value):
+    """문자열/float → int 변환. 변환 실패 시 None 반환"""
+    value = empty_to_none(value)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def to_str_or_none(value):
+    """값을 문자열로 변환하고 빈 값은 None으로 처리"""
+    value = empty_to_none(value)
+    if value is None:
+        return None
+    return str(value).strip() or None
+
+
 # ── API 호출 함수 ─────────────────────────────────────────────
-async def fetch_stores(
-    client: httpx.AsyncClient,
+def fetch_stores(
+    client: httpx.Client,
     gu_code: str,
     page: int = 1,
     num_of_rows: int = 1000,
@@ -84,8 +106,9 @@ async def fetch_stores(
 ):
     """
     소상공인 API 호출
-    - client: 파이프라인 전체에서 재사용하는 AsyncClient (연결 풀 활용)
-    - 502 등 서버 오류 시 최대 3번 재시도 (3초 간격)
+    - 429 및 일시적인 5xx 서버 오류 재시도
+    - Timeout, 연결 오류 재시도
+    - 최대 3회, 3초 간격
     """
     params = {
         "serviceKey": API_KEY,
@@ -96,30 +119,40 @@ async def fetch_stores(
         "numOfRows": num_of_rows,
     }
 
-    for attempt in range(max_retries):
+    retryable_status_codes = {429, 500, 502, 503, 504}
+
+    for attempt in range(1, max_retries + 1):
         try:
-            response = await client.get(BASE_URL, params=params)
+            response = client.get(BASE_URL, params=params)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 502 and attempt < max_retries - 1:
-                # 502 오류
-                logger.warning(
-                    f"  502 오류 발생. 3초 후 재시도... ({attempt + 1}/{max_retries})"
-                )
-
-                await asyncio.sleep(3)
-            else:
+            if (
+                e.response.status_code not in retryable_status_codes
+                or attempt == max_retries
+            ):
                 raise
+            logger.warning(
+                f"[{gu_code}] 페이지 {page} HTTP {e.response.status_code} 오류. 3초 후 재시도 ({attempt}/{max_retries})"
+            )
+        except (httpx.TimeoutException, httpx.RequestError) as e:
+            if attempt == max_retries:
+                raise
+            logger.warning(
+                f"[{gu_code}] 페이지 {page} 네트워크 오류: {e}. 3초 후 재시도 ({attempt}/{max_retries})"
+            )
+        time.sleep(3)
+
+    raise RuntimeError(f"[{gu_code}] 페이지 {page} API 재시도 한도를 초과했습니다.")
 
 
 # ── district 일괄 조회 함수 ───────────────────────────────────
-async def get_district_map(session, district_codes: set) -> dict:
+def get_district_map(session, district_codes: set) -> dict:
     """
     district_code 목록을 한 번에 IN 쿼리로 조회 → {code: district_id} 딕셔너리 반환
     - 행마다 SELECT 하지 않고 페이지당 1회만 조회 (DB 왕복 최소화)
     """
-    result = await session.execute(
+    result = session.execute(
         select(District.district_code, District.id).where(
             District.district_code.in_(district_codes)
         )
@@ -153,21 +186,13 @@ def build_business_value(item: dict, district_id: int) -> dict:
         pnu_code=empty_to_none(item.get("lnoCd")),
         plot_sct_code=empty_to_none(item.get("plotSctCd")),
         plot_sct_name=empty_to_none(item.get("plotSctNm")),
-        land_main_no=int(item.get("lnoMnno"))
-        if item.get("lnoMnno") not in [None, ""]
-        else None,
-        land_sub_no=str(item.get("lnoSlno"))
-        if item.get("lnoSlno") not in [None, ""]
-        else None,
+        land_main_no=to_int_or_none(item.get("lnoMnno")),
+        land_sub_no=to_str_or_none(item.get("lnoSlno")),
         land_address=empty_to_none(item.get("lnoAdr")),
         road_name_code=empty_to_none(item.get("rdnmCd")),
         road_name=empty_to_none(item.get("rdnm")),
-        bld_main_no=int(item.get("bldMnno"))
-        if item.get("bldMnno") not in [None, ""]
-        else None,
-        bld_sub_no=str(item.get("bldSlno"))
-        if item.get("bldSlno") not in [None, ""]
-        else None,
+        bld_main_no=to_int_or_none(item.get("bldMnno")),
+        bld_sub_no=to_str_or_none(item.get("bldSlno")),
         building_mgmt_no=empty_to_none(item.get("bldMngNo")),
         building_name=empty_to_none(item.get("bldNm")),
         road_address=empty_to_none(item.get("rdnmAdr")),
@@ -176,19 +201,19 @@ def build_business_value(item: dict, district_id: int) -> dict:
         dong_no=empty_to_none(item.get("dongNo")),
         floor_no=empty_to_none(item.get("flrNo")),
         unit_no=empty_to_none(item.get("hoNo")),
-        lng=item.get("lon"),
-        lat=item.get("lat"),
+        lng=empty_to_none(item.get("lon")),
+        lat=empty_to_none(item.get("lat")),
         open_status="영업중",
     )
 
 
 # ── 메인 파이프라인 함수 ──────────────────────────────────────
-async def run_districts_pipeline():
+def run_districts_pipeline():
     """
     districts + businesses 전체 파이프라인 실행
     - 서울 25개 구 코드 반복 호출
     - 소상공인 API 1회 호출로 districts + businesses 동시 적재
-    - AsyncClient를 파이프라인 전체에서 1회만 생성해 HTTP 연결 재사용
+    - 순차 배치 작업으로 동기 방식 처리
     - 페이지네이션 처리 (totalCount 기준)
     """
     if not API_KEY:
@@ -196,8 +221,8 @@ async def run_districts_pipeline():
 
     logger.info("상가정보 수집 시작")
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        async with AsyncSessionLocal() as session:
+    with httpx.Client(timeout=30) as client:
+        with SyncSessionLocal() as session:
             for gu_code in GU_CODES:
                 logger.info(f"[{gu_code}] 수집 시작...")
 
@@ -211,7 +236,7 @@ async def run_districts_pipeline():
                             f"[{gu_code}] 최대 페이지 수 초과 ({MAX_PAGES}). 전체 데이터 수집이 완료되지 않았습니다."
                         )
 
-                    data = await fetch_stores(
+                    data = fetch_stores(
                         client, gu_code, page=page, num_of_rows=PAGE_SIZE
                     )
 
@@ -224,7 +249,17 @@ async def run_districts_pipeline():
                     items = body.get("items", [])
 
                     if total_count is None:
-                        total_count = int(body.get("totalCount", 0))
+                        raw_total_count = body.get("totalCount")
+                        if raw_total_count is None:
+                            raise RuntimeError(
+                                f"[{gu_code}] API 응답에 totalCount가 없습니다."
+                            )
+                        try:
+                            total_count = int(raw_total_count)
+                        except (TypeError, ValueError) as e:
+                            raise RuntimeError(
+                                f"[{gu_code}] 잘못된 totalCount 값: {raw_total_count!r}"
+                            ) from e
                         logger.info(f"  총 {total_count}건")
 
                     if not items:
@@ -249,10 +284,10 @@ async def run_districts_pipeline():
                             .values(list(district_values_by_code.values()))
                             .on_conflict_do_nothing(index_elements=["district_code"])
                         )
-                        await session.execute(district_stmt)
+                        session.execute(district_stmt)
 
                         # Step 2: district_id 일괄 조회
-                        district_map = await get_district_map(
+                        district_map = get_district_map(
                             session, set(district_values_by_code.keys())
                         )
 
@@ -267,7 +302,7 @@ async def run_districts_pipeline():
 
                         # Step 3: 업소 중복 제거 후 Batch UPSERT
                         # PostgreSQL 최대 파라미터 수 제한(32,767개)으로 BATCH_SIZE 단위로 나눠서 처리
-                        # 업소 1건당 컬럼 33개 → 500건 = 16,500개 파라미터로 여유있게 처리
+                        # 업소 1건당 컬럼 35개 → 500건 = 17,500개 파라미터로 여유있게 처리
                         business_values_by_code = {}
                         for item in items:
                             district_id = district_map.get(item["adongCd"])
@@ -414,12 +449,12 @@ async def run_districts_pipeline():
                                     ),
                                 },
                             )
-                            await session.execute(business_stmt)
+                            session.execute(business_stmt)
 
-                        await session.commit()
+                        session.commit()
 
                     except Exception:
-                        await session.rollback()
+                        session.rollback()
                         logger.exception(f"[{gu_code}] 페이지 {page} 적재 실패")
                         raise
 
@@ -429,6 +464,7 @@ async def run_districts_pipeline():
                     if page * PAGE_SIZE >= total_count:
                         break
                     page += 1
+                    # time.sleep(0.5)  # API 서버 부하 방지
 
     logger.info("상가정보 수집 완료!")
 
@@ -439,5 +475,4 @@ if __name__ == "__main__":
         level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
-
-    asyncio.run(run_districts_pipeline())
+    run_districts_pipeline()

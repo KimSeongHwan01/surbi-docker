@@ -3,16 +3,17 @@
 # 공공데이터 수집 파이프라인 자동화 스케줄러
 #
 # 실행 방식: docker-compose.yml worker 서비스가 자동 실행
-# command: python -m arq app.workers.main.WorkerSettings
+# command: python -m arq workers.main.WorkerSettings
 #
 # 스케줄 정책:
-# - populations        : 매일 새벽 3시 (API 약 5일 지연 제공)
-# - government_supports: 매주 월요일 새벽 3시
-# - sales_stats        : 월 1회 (매월 1일 새벽 3시)
-# - market_trends      : 월 1회 (매월 1일 새벽 3시)
-# - districts          : 월 1회 (매월 1일 새벽 4시)
+# - districts          : 월 1회 (매월 1일 새벽 2시) — district_id 기반 적재의 선행 작업
+# - sales_stats        : 월 1회 (매월 1일 새벽 3시) — districts 완료 후 실행
+# - market_trends      : 월 1회 (매월 1일 새벽 3시 20분) — districts 이후, 매출과 시작 시각 분리
+# - populations        : 매일 새벽 4시 — 월 1일에도 districts 갱신 이후 실행
+# - government_supports: 매주 월요일 새벽 4시 30분 — 독립 테이블, 주요 수집 시간대와 분리
 
 
+import asyncio
 import logging
 import os
 
@@ -76,7 +77,7 @@ logger = logging.getLogger(__name__)
 async def task_populations(ctx: dict) -> str:
     """생활인구 수집 — 매일"""
     try:
-        await run_populations_pipeline()
+        await asyncio.to_thread(run_populations_pipeline)
         await send_webhook("✅ 생활인구 수집 완료")
         return "ok"
     except Exception as e:
@@ -87,7 +88,7 @@ async def task_populations(ctx: dict) -> str:
 async def task_government_supports(ctx: dict) -> str:
     """정부지원사업 수집 — 매주 월요일"""
     try:
-        await run_government_supports_pipeline()
+        await asyncio.to_thread(run_government_supports_pipeline)
         await send_webhook("✅ 정부지원사업 수집 완료")
         return "ok"
     except Exception as e:
@@ -98,7 +99,7 @@ async def task_government_supports(ctx: dict) -> str:
 async def task_sales_stats(ctx: dict) -> str:
     """추정매출 수집 — 월 1회"""
     try:
-        await run_sales_pipeline()
+        await asyncio.to_thread(run_sales_pipeline)
         await send_webhook("✅ 추정매출 수집 완료")
         return "ok"
     except Exception as e:
@@ -109,7 +110,7 @@ async def task_sales_stats(ctx: dict) -> str:
 async def task_market_trends(ctx: dict) -> str:
     """상권변화지표 수집 — 월 1회"""
     try:
-        await run_market_trends_pipeline()
+        await asyncio.to_thread(run_market_trends_pipeline)
         await send_webhook("✅ 상권변화지표 수집 완료")
         return "ok"
     except Exception as e:
@@ -120,7 +121,7 @@ async def task_market_trends(ctx: dict) -> str:
 async def task_districts(ctx: dict) -> str:
     """상가정보 수집 — 월 1회"""
     try:
-        await run_districts_pipeline()
+        await asyncio.to_thread(run_districts_pipeline)
         await send_webhook("✅ 상가정보 수집 완료")
         return "ok"
     except Exception as e:
@@ -132,7 +133,7 @@ async def task_districts(ctx: dict) -> str:
 class WorkerSettings:
     """
     ARQ WorkerSettings — arq CLI가 이 클래스를 참조
-    docker-compose.yml: command: python -m arq app.workers.main.WorkerSettings
+    docker-compose.yml: command: python -m arq workers.main.WorkerSettings
     """
 
     redis_settings = RedisSettings.from_dsn(REDIS_URL)
@@ -148,14 +149,14 @@ class WorkerSettings:
     ]
 
     cron_jobs = [
-        # 생활인구 — 매일 새벽 3시
-        cron(task_populations, hour=3, minute=0),
-        # 정부지원사업 — 매주 월요일 새벽 3시
-        cron(task_government_supports, weekday=0, hour=3, minute=0),
-        # 추정매출 — 월 1회 (매월 1일 새벽 3시)
+        # 상가정보·행정동 — 모든 district_id 기반 적재의 선행 작업 (가장 오래 걸림)
+        cron(task_districts, day=1, hour=2, minute=0),
+        # 추정매출 — districts 갱신 완료 후 실행 (약 1시간 여유)
         cron(task_sales_stats, day=1, hour=3, minute=0),
-        # 상권변화지표 — 월 1회 (매월 1일 새벽 3시)
-        cron(task_market_trends, day=1, hour=3, minute=0),
-        # 상가정보 — 월 1회 (매월 1일 새벽 4시)
-        cron(task_districts, day=1, hour=4, minute=0),
+        # 상권변화지표 — districts 이후, 매출 작업과 시작 시각 분리
+        cron(task_market_trends, day=1, hour=3, minute=20),
+        # 생활인구 — 매일 수집, 월 1일에도 districts 갱신 이후 실행
+        cron(task_populations, hour=4, minute=0),
+        # 정부지원사업 — 독립 테이블, 주요 수집 시간대와 분리
+        cron(task_government_supports, weekday="mon", hour=4, minute=30),
     ]
