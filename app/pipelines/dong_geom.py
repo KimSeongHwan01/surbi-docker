@@ -39,6 +39,10 @@ CACHE_DIR = Path(os.getenv("DONG_GEOM_CACHE", "./data/.cache"))
 # 임시 테이블 INSERT 단위
 BATCH_SIZE = 100
 
+# 적재 허용 매칭률 하한. 이 아래면 적재하지 않고 실패 처리한다.
+# 2026-08-07 실측 100%(427/427) 기준으로 여유를 둔 값.
+MIN_MATCH_RATE = 0.95
+
 # ── 로거 설정 ─────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
 
@@ -188,10 +192,11 @@ def stage_raw(session, rows: list[dict]) -> None:
 
 
 # ── 매칭률 점검 함수 ──────────────────────────────────────────
-def report_match_rate(session) -> str:
+def report_match_rate(session) -> tuple[str, float]:
     """
-    세 가지 매칭 방식을 모두 시도하고 성공률이 가장 높은 방식을 반환
+    네 가지 매칭 방식을 모두 시도하고 (성공률이 가장 높은 방식, 그 비율)을 반환
     - 코드 체계(통계청 8자리 / 행안부 10자리)를 미리 알 필요 없이 판별 가능
+    - 비율은 자동 실행 시 하한 검사(min_match_rate)에 쓰인다
     """
     total = session.execute(text("SELECT count(*) FROM districts;")).scalar()
     if not total:
@@ -216,7 +221,7 @@ def report_match_rate(session) -> str:
 
     logger.info(f"  선택된 방식: {best}")
     log_unmatched(session, best)
-    return best
+    return best, candidates[best] / total
 
 
 # ── 미매칭 진단 함수 ──────────────────────────────────────────
@@ -328,12 +333,22 @@ def verify_extent(session) -> None:
 
 
 # ── 메인 파이프라인 함수 ──────────────────────────────────────
-def run_dong_geom_pipeline(apply: bool = False, strategy: str | None = None) -> None:
+def run_dong_geom_pipeline(
+    apply: bool = False,
+    strategy: str | None = None,
+    min_match_rate: float = MIN_MATCH_RATE,
+) -> None:
     """
     행정동 경계 적재 전체 파이프라인 실행
-    - apply=False: 매칭률만 확인하고 롤백 (기본값)
-    - apply=True : 실제 반영
-    - strategy   : 매칭 방식 고정. None이면 성공률 기준 자동 선택
+    - apply=False    : 매칭률만 확인하고 롤백 (기본값)
+    - apply=True     : 실제 반영
+    - strategy       : 매칭 방식 고정. None이면 성공률 기준 자동 선택
+    - min_match_rate : 이 비율 미만이면 적재를 거부하고 실패 처리
+
+    min_match_rate 는 무인 실행(ARQ Worker) 대비용이다.
+    행정동 개편으로 이름 규칙이 바뀌면 매칭률이 뚝 떨어질 수 있는데,
+    사람이 로그를 보지 않는 상황에서 그대로 적용하면 경계가 대량 누락된다.
+    실패로 처리해야 Discord 알림이 나가서 인지할 수 있다.
     """
     logger.info("행정동 경계 적재 시작")
 
@@ -343,12 +358,26 @@ def run_dong_geom_pipeline(apply: bool = False, strategy: str | None = None) -> 
     with SyncSessionLocal() as session:
         try:
             stage_raw(session, rows)
-            chosen = strategy or report_match_rate(session)
+
+            if strategy:
+                chosen, rate = strategy, None
+                logger.info(f"  매칭 방식 수동 지정: {chosen}")
+            else:
+                chosen, rate = report_match_rate(session)
 
             if not apply:
                 session.rollback()
                 logger.info("확인 모드 — DB는 변경되지 않았습니다. 반영하려면 --apply 옵션을 주세요.")
                 return
+
+            # 하한 검사는 자동 선택일 때만. 수동 지정은 사람이 판단한 것으로 본다.
+            if rate is not None and rate < min_match_rate:
+                session.rollback()
+                raise RuntimeError(
+                    f"매칭률 {rate * 100:.1f}%가 하한 {min_match_rate * 100:.0f}% 미만이라 "
+                    f"적재를 중단했습니다. 행정동 개편으로 이름 규칙이 바뀌었을 수 있습니다. "
+                    f"확인 후 --min-match-rate 로 하한을 낮춰 재실행하세요."
+                )
 
             update_geom(session, chosen)
             verify_extent(session)
@@ -371,8 +400,18 @@ if __name__ == "__main__":
         choices=list(JOIN_CONDITIONS),
         help="매칭 방식 고정 (기본: 성공률 기준 자동 선택)",
     )
+    parser.add_argument(
+        "--min-match-rate",
+        type=float,
+        default=MIN_MATCH_RATE,
+        help=f"적재 허용 매칭률 하한 (기본: {MIN_MATCH_RATE})",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    run_dong_geom_pipeline(apply=args.apply, strategy=args.strategy)
+    run_dong_geom_pipeline(
+        apply=args.apply,
+        strategy=args.strategy,
+        min_match_rate=args.min_match_rate,
+    )
