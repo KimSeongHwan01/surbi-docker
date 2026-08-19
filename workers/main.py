@@ -7,9 +7,11 @@
 #
 # 스케줄 정책:
 # - districts          : 월 1회 (매월 1일 새벽 2시) — district_id 기반 적재의 선행 작업
+# - dong_geom          : 월 1회 (매월 1일 새벽 2시 40분) — districts로 신설된 행정동의 경계 보충
 # - sales_stats        : 월 1회 (매월 1일 새벽 3시) — districts 완료 후 실행
 # - market_trends      : 월 1회 (매월 1일 새벽 3시 20분) — districts 이후, 매출과 시작 시각 분리
 # - populations        : 매일 새벽 4시 — 월 1일에도 districts 갱신 이후 실행
+# - subway_stats       : 매일 새벽 4시 15분 — 생활인구와 시작 시각 분리
 # - government_supports: 매주 월요일 새벽 4시 30분 — 독립 테이블, 주요 수집 시간대와 분리
 
 
@@ -22,10 +24,12 @@ from arq import cron
 from arq.connections import RedisSettings
 
 from app.pipelines.districts import run_districts_pipeline
+from app.pipelines.dong_geom import run_dong_geom_pipeline
 from app.pipelines.government_supports import run_government_supports_pipeline
 from app.pipelines.market_trends import run_market_trends_pipeline
 from app.pipelines.populations import run_populations_pipeline
 from app.pipelines.sales_stats import run_sales_pipeline
+from app.pipelines.subway_stats import run_subway_stats_pipeline
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
@@ -85,6 +89,17 @@ async def task_populations(ctx: dict) -> str:
         raise
 
 
+async def task_subway_stats(ctx: dict) -> str:
+    """지하철역 유동인구 수집 — 매일"""
+    try:
+        await asyncio.to_thread(run_subway_stats_pipeline)
+        await send_webhook("✅ 지하철역 유동인구 수집 완료")
+        return "ok"
+    except Exception as e:
+        await send_webhook(f"❌ 지하철역 유동인구 수집 실패\n{e}", success=False)
+        raise
+
+
 async def task_government_supports(ctx: dict) -> str:
     """정부지원사업 수집 — 매주 월요일"""
     try:
@@ -129,6 +144,25 @@ async def task_districts(ctx: dict) -> str:
         raise
 
 
+async def task_dong_geom(ctx: dict) -> str:
+    """
+    행정동 경계 적재 — 월 1회
+
+    경계 자체는 행정동 개편 때만 바뀌므로 대부분의 실행은 변화가 없다.
+    그럼에도 매월 도는 이유는 task_districts가 신설 행정동을 INSERT할 때
+    그 행의 geom이 NULL로 남기 때문이다. 에러가 나지 않아 조용히 누락된다.
+
+    경계 파일 버전이 그대로면 캐시를 재사용하므로 재다운로드는 없다.
+    """
+    try:
+        await asyncio.to_thread(run_dong_geom_pipeline, True)
+        await send_webhook("✅ 행정동 경계 적재 완료")
+        return "ok"
+    except Exception as e:
+        await send_webhook(f"❌ 행정동 경계 적재 실패\n{e}", success=False)
+        raise
+
+
 # ── WorkerSettings ────────────────────────────────────────────
 class WorkerSettings:
     """
@@ -142,21 +176,28 @@ class WorkerSettings:
 
     functions = [
         task_populations,
+        task_subway_stats,
         task_government_supports,
         task_sales_stats,
         task_market_trends,
         task_districts,
+        task_dong_geom,
     ]
 
     cron_jobs = [
         # 상가정보·행정동 — 모든 district_id 기반 적재의 선행 작업 (가장 오래 걸림)
         cron(task_districts, day=1, hour=2, minute=0),
+        # 행정동 경계 — districts로 신설된 행정동의 geom 보충
+        # 실측 상가정보 수집이 약 8분이라 40분이면 충분한 여유
+        cron(task_dong_geom, day=1, hour=2, minute=40),
         # 추정매출 — districts 갱신 완료 후 실행 (약 1시간 여유)
         cron(task_sales_stats, day=1, hour=3, minute=0),
         # 상권변화지표 — districts 이후, 매출 작업과 시작 시각 분리
         cron(task_market_trends, day=1, hour=3, minute=20),
         # 생활인구 — 매일 수집, 월 1일에도 districts 갱신 이후 실행
         cron(task_populations, hour=4, minute=0),
+        # 지하철역 유동인구 — 매일 수집
+        cron(task_subway_stats, hour=4, minute=15),
         # 정부지원사업 — 독립 테이블, 주요 수집 시간대와 분리
         cron(task_government_supports, weekday="mon", hour=4, minute=30),
     ]
