@@ -84,6 +84,11 @@ def run_scores_pipeline(csv_file_path: str = CSV_FILE_PATH):
                     "score": float(row["score"]),
                     "expected_sales": int(float(row["expected_sales"])),
                     "closure_risk": float(row["closure_risk"]),
+                    "foot_traffic_index": float(row["foot_traffic_index"]),
+                    "category_spending_power": float(row["category_spending_power"]),
+                    "competition_intensity": float(row["competition_intensity"]),
+                    "accessibility": float(row["accessibility"]),
+                    "operation_stability": float(row["operation_stability"]),
                 }
 
             values_list = list(values_by_key.values())
@@ -101,6 +106,11 @@ def run_scores_pipeline(csv_file_path: str = CSV_FILE_PATH):
                             "score": stmt.excluded.score,
                             "expected_sales": stmt.excluded.expected_sales,
                             "closure_risk": stmt.excluded.closure_risk,
+                            "foot_traffic_index": stmt.excluded.foot_traffic_index,
+                            "category_spending_power": stmt.excluded.category_spending_power,
+                            "competition_intensity": stmt.excluded.competition_intensity,
+                            "accessibility": stmt.excluded.accessibility,
+                            "operation_stability": stmt.excluded.operation_stability,
                             "recorded_at": stmt.excluded.recorded_at,
                         },
                     )

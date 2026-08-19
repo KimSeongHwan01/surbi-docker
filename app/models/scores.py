@@ -52,6 +52,12 @@ class Score(Base):
     closure_risk = Column(
         Numeric(5, 2), nullable=True
     )  # 폐업 위험도 (0~100, 높을수록 위험)
+    # ML 세분화 점수 (5개 항목)
+    foot_traffic_index = Column(Numeric(5, 2), nullable=True)  # 유동인구 지수 (0~20)
+    category_spending_power = Column(Numeric(5, 2), nullable=True)  # 업종 소비력 (0~25)
+    competition_intensity = Column(Numeric(5, 2), nullable=True)  # 경쟁 강도 (0~20)
+    accessibility = Column(Numeric(5, 2), nullable=True)  # 접근성 (0~15)
+    operation_stability = Column(Numeric(5, 2), nullable=True)  # 운영 안정성 (0~20)
 
     recorded_at = Column(DateTime, server_default=func.now())  # 적재 시각
 
