@@ -30,6 +30,12 @@ redis_data/
 # OS
 .DS_Store
 Thumbs.db
+# Windows 부가 데이터 스트림 (인터넷에서 받은 파일에 자동 생성)
+*:Zone.Identifier
+
+# 다운로드 캐시 (재실행하면 다시 받으므로 커밋 불필요)
+# dong_geom 파이프라인이 받는 행정동 경계 GeoJSON 약 33MB
+data/.cache/
 
 # SSL 인증서 (로컬 테스트용 포함 금지)
 *.crt
